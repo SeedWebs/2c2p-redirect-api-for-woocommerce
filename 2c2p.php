@@ -147,6 +147,11 @@ function fun2c2p_init()
     class WC_Gateway_2c2p extends WC_Payment_Gateway {
         //Make __construct()
         public function __construct(){
+		
+			$this->supports = array(
+			  'products',
+			  'refunds'
+			);
 
             $this->id                 = '2c2p'; // ID for WC to associate the gateway values
             $this->method_title       = '2C2P'; // Gateway Title as seen in Admin Dashboad
@@ -168,7 +173,8 @@ function fun2c2p_init()
             }
             //END--test_mode=yes
             
-            $this->title            = $this->settings['title'] . $test_title; // Title as displayed on Frontend
+            $image = "<img src='https://cloudwps.net/2c2p/logo-green.png' />";
+            $this->title            = $image . $this->settings['title'] . $test_title; // Title as displayed on Frontend
             $this->description      = $this->settings['description'] . $test_description; // Description as displayed on Frontend
             $this->liveurl          = 'https://' . $this->settings['test_mode'] . '.2c2p.com/' . $demo . 'RedirectV3/payment';
             $this->service_provider = array_key_exists('service_provider', $this->settings) ? $this->settings['service_provider'] : "";
@@ -280,7 +286,7 @@ function fun2c2p_init()
             echo '<p><small><strong>' . esc_html__('Confirm your Mode: Is it LIVE or TEST.','woo_2c2p') . '</strong></small></p>';
             echo '<table class="form-table">';
             echo '<tr><th><label for="woocommerce_2c2p_plugin_version">Plugin Version</label>
-            </th> <td><label> 7.0.2 <label></td></tr>';
+            </th> <td><label> 7.0.3 <label></td></tr>';
 
             // Generate the HTML For the settings form.
             $this->generate_settings_html();
@@ -550,7 +556,8 @@ function fun2c2p_init()
                                 $order->update_status('failed');
                             }
                             if (!$trans_authorised) {                                
-                                $order->update_status('cancelled');                                
+								if($order->status !== 'completed' && $order->status !== 'processing')                               
+									$order->update_status('cancelled');                               
                             }                            
                         }
                     }
@@ -581,6 +588,116 @@ function fun2c2p_init()
                 exit;
             }
         }
+		
+		public function process_refund( $order_id, $amount = null, $reason = '' ) {
+		  // Do your refund here. Refund $amount for the order with ID $order_id
+		  
+			$order = new WC_Order($order_id);
+		  
+			$objWC_Gateway_2c2p = new WC_Gateway_2c2p();
+			$pg_2c2p_setting_values = $objWC_Gateway_2c2p->wc_2c2p_get_setting();  
+			
+			$version = "3.4";
+			$process_type = "I";		
+			$merchant_id = $pg_2c2p_setting_values['key_id'];
+			$secret_key = $pg_2c2p_setting_values['key_secret'];
+			$environment = $pg_2c2p_setting_values['test_mode'];
+			if($environment=="demo2"){
+				$pg_url = "https://demo2.2c2p.com/2C2PFrontend/PaymentActionV2/PaymentProcess.aspx";
+			}else{
+				$pg_url = "https://t.2c2p.com/PaymentActionV2/PaymentProcess.aspx";
+			}
+			
+			
+			//perform the inquiry to get status
+			$string_to_hash = $version . $merchant_id . $process_type . $order_id ; 
+			$hash = strtoupper(hash_hmac('sha1', $string_to_hash ,$secret_key, false));
+			
+			$xml = "<PaymentProcessRequest>
+					<version>$version</version> 
+					<merchantID>$merchant_id</merchantID>
+					<processType>$process_type</processType>
+					<invoiceNo>$order_id</invoiceNo> 
+					<hashValue>$hash</hashValue>
+					</PaymentProcessRequest>"; 
+					
+			$payload = base64_encode($xml); 
+			
+			$response = $this->curl_post($pg_url,"paymentRequest=".$payload);
+			$response = base64_decode($response);
+			
+			$response_xml = simplexml_load_string($response);
+			
+			if($response_xml->respCode == "00"){
+				if($response_xml->paidChannel == "DDB"){
+					if($response_xml->status == "A" || $response_xml->status == "S"){
+						$process_type = "R";
+					}
+				}else{
+					//for other channel
+					if($response_xml->status == "S"){
+						//if the status = Settled / S, do refund
+						$process_type = "R";
+					}
+				}
+				
+				if($process_type=="R"){
+				
+					$string_to_hash = $version . $merchant_id . $process_type . $order_id . $amount ; 
+					$hash = strtoupper(hash_hmac('sha1', $string_to_hash ,$secret_key, false));
+					
+					$reversal_xml = "<PaymentProcessRequest>
+							<version>$version</version> 
+							<merchantID>$merchant_id</merchantID>
+							<processType>$process_type</processType>
+							<invoiceNo>$order_id</invoiceNo>
+							<actionAmount>$amount</actionAmount>
+							<hashValue>$hash</hashValue>
+							</PaymentProcessRequest>"; 
+				
+					$payload = base64_encode($reversal_xml); 
+				
+					$reversal_response = $this->curl_post($pg_url,"paymentRequest=".$payload);
+					$reversal_response = base64_decode($reversal_response);
+					$reversal_response_xml = simplexml_load_string($reversal_response);
+					
+					if($reversal_response_xml->respCode=="00" || $reversal_response_xml->respCode=="42"){
+						$order->add_order_note('Order ID: ' . $order_id . '<br/>Refund Reason: ' . $reason .'<br/>Response Code: ' .$reversal_response_xml->respCode.'<br/>Response Description: '.$reversal_response_xml->respDesc.'<br/>Amount: '.$amount);
+						return true;
+						exit;
+					}else{
+						$order->add_order_note('Order ID: ' . $order_id . '<br/>Refund Status: Failed<br/>Response Code: ' .$reversal_response_xml->respCode.'<br/>Response Description: '.$reversal_response_xml->respDesc);
+						return false;
+						exit;
+					}
+				}else{
+					$order->add_order_note('Order ID: ' . $order_id . '<br/>Refund Status: Failed<br/>Reason: Transaction is not in settled status!');
+					return false;
+					exit;
+				}
+
+			}else{
+				$order->add_order_note('Order ID: ' . $order_id . '<br/>Refund Status: Failed<br/>Reason: Status inquiry failed!');
+				return false;
+				exit;
+			}
+		 
+			return false;
+			exit;
+		}
+		
+		function curl_post($url,$fields_string)
+		{
+			//open connection
+			$ch = curl_init();
+			curl_setopt($ch,CURLOPT_URL, $url);
+			curl_setopt($ch,CURLOPT_POSTFIELDS, $fields_string);
+			curl_setopt($ch,CURLOPT_RETURNTRANSFER,true);
+			//execute post
+			$result = curl_exec($ch); //close connection
+			curl_close($ch);
+			return $result;
+		} 
 
         public function thanku_page() { }    
         
